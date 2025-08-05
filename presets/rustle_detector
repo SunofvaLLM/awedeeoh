@@ -1,0 +1,9 @@
+{
+    "gain_db": 40,
+    "compressor_threshold_db": -70,
+    "compressor_ratio": 18,
+    "compressor_attack_ms": 1,
+    "compressor_release_ms": 200,
+    "speech_focus_enabled": true,
+    "limiter_enabled": true
+}
