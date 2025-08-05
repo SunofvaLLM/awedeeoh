@@ -1,4 +1,3 @@
-import pyaudio
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -9,7 +8,7 @@ import queue
 class AudioPipeline:
     """
     Manages the real-time audio processing pipeline with advanced "Super Hearing" features.
-    Includes a stateful compressor with attack/release and a final brickwall limiter.
+    This version includes multiple gain stages for fine-tuned control.
     """
     def __init__(self, input_device_index, output_device_index, sample_rate=44100, chunk_size=1024):
         self.input_device_index = input_device_index
@@ -21,25 +20,26 @@ class AudioPipeline:
         self.is_running = False
         self.lock = threading.Lock()
 
-        # --- Audio Enhancement Parameters ---
-        self.gain_db = 10.0
-        self.noise_gate_threshold = 0.01
+        # --- Multi-stage Gain Parameters ---
+        self.input_gain_db = 0.0      # Pre-processing gain (Sensitivity)
+        self.gain_db = 10.0           # Post-compressor makeup gain
+        self.output_gain_db = 0.0     # Final output gain (Volume)
 
         # --- Super Hearing Parameters ---
+        self.noise_gate_threshold = 0.01
         self.compressor_enabled = True
-        self.compressor_threshold_db = -50.0 # dBFS
-        self.compressor_ratio = 8.0 # 8:1 ratio
-        self.compressor_attack_ms = 5.0 # Time to react
-        self.compressor_release_ms = 100.0 # Time to recover
-        # Internal state for the compressor
+        self.compressor_threshold_db = -50.0
+        self.compressor_ratio = 8.0
+        self.compressor_attack_ms = 5.0
+        self.compressor_release_ms = 100.0
         self._compressor_gain_reduction = 1.0 
 
         self.speech_focus_enabled = False
-        self.band_pass_low_cutoff = 300.0 # Hz
-        self.band_pass_high_cutoff = 3400.0 # Hz
+        self.band_pass_low_cutoff = 300.0
+        self.band_pass_high_cutoff = 3400.0
         
         self.limiter_enabled = True
-        self.limiter_threshold_db = -1.0 # dBFS
+        self.limiter_threshold_db = -1.0
 
         # --- Recording State ---
         self.is_recording = False
@@ -60,16 +60,19 @@ class AudioPipeline:
                 self.recording_queue.put(processed_data.copy())
 
     def process_frame(self, data):
-        """Applies all enabled audio enhancements to a frame."""
+        """
+        Applies all enabled audio enhancements to a frame in a specific order.
+        """
         audio_data = data.astype(np.float32)
 
-        # 1. Noise Gate
+        # 1. Input Gain (Sensitivity)
+        # Applied first to boost the raw signal before any processing.
+        if self.input_gain_db != 0:
+            audio_data *= 10**(self.input_gain_db / 20.0)
+
+        # 2. Noise Gate
         if self.noise_gate_threshold > 0:
             audio_data[np.abs(audio_data) < self.noise_gate_threshold] = 0.0
-
-        # 2. Gain / Amplification
-        gain_factor = 10**(self.gain_db / 20.0)
-        audio_data *= gain_factor
         
         # 3. Speech Focus Filter (Band-pass)
         if self.speech_focus_enabled:
@@ -82,67 +85,57 @@ class AudioPipeline:
 
         # 4. Super Hearing Compressor
         if self.compressor_enabled:
-            audio_data = self._dynamic_range_compressor_stateful(
-                audio_data
-            )
+            audio_data = self._dynamic_range_compressor_stateful(audio_data)
 
-        # 5. Brickwall Limiter (Final Stage)
+        # 5. Makeup Gain
+        # Applied after the compressor to make up for overall volume reduction.
+        if self.gain_db != 0:
+            audio_data *= 10**(self.gain_db / 20.0)
+            
+        # 6. Output Gain (Volume)
+        # A final volume control before the limiter.
+        if self.output_gain_db != 0:
+            audio_data *= 10**(self.output_gain_db / 20.0)
+
+        # 7. Brickwall Limiter (Final Stage)
+        # Prevents clipping from all the previous gain stages.
         if self.limiter_enabled:
             audio_data = self._limiter(audio_data, self.limiter_threshold_db)
 
-        # Clamp to prevent clipping (final safety net)
+        # Final safety clamp
         np.clip(audio_data, -1.0, 1.0, out=audio_data)
         
         return audio_data
 
     def _dynamic_range_compressor_stateful(self, data):
-        """
-        Applies compression with attack and release times for smoother gain reduction.
-        This method is stateful and processes the audio sample by sample.
-        """
-        if self.compressor_ratio <= 1:
-            return data
+        """Applies compression with attack and release times."""
+        if self.compressor_ratio <= 1: return data
 
-        # Calculate attack and release coefficients based on sample rate
-        # These determine how many samples it takes to reach the target gain
         attack_coeff = np.exp(-1.0 / (self.sample_rate * (self.compressor_attack_ms / 1000.0)))
         release_coeff = np.exp(-1.0 / (self.sample_rate * (self.compressor_release_ms / 1000.0)))
-        
         threshold_linear = 10**(self.compressor_threshold_db / 20.0)
         processed_data = np.zeros_like(data)
 
-        # Process sample by sample to correctly model attack/release
         for i, sample in enumerate(data):
-            # Determine if the sample is above the threshold
             if abs(sample) > threshold_linear:
-                # Calculate the target gain reduction
                 target_gain = (threshold_linear + (abs(sample) - threshold_linear) / self.compressor_ratio) / abs(sample)
-                # Move towards the target gain using the attack coefficient
                 self._compressor_gain_reduction = (attack_coeff * self._compressor_gain_reduction) + (1 - attack_coeff) * target_gain
             else:
-                # If below threshold, move back towards 1.0 (no gain reduction)
                 self._compressor_gain_reduction = (release_coeff * self._compressor_gain_reduction) + (1 - release_coeff) * 1.0
             
-            # Apply the calculated gain reduction to the sample
             processed_data[i] = sample * self._compressor_gain_reduction
             
         return processed_data
 
     def _limiter(self, data, threshold_db):
-        """Applies a hard brickwall limiter to prevent clipping."""
+        """Applies a hard brickwall limiter."""
         threshold_linear = 10**(threshold_db / 20.0)
-        
-        # Find samples that exceed the limiter threshold
         clipping_mask = np.abs(data) > threshold_linear
-        
-        # For those samples, reduce their amplitude to the threshold
-        # while preserving their sign.
         data[clipping_mask] = np.sign(data[clipping_mask]) * threshold_linear
-        
         return data
 
     def _band_pass_filter(self, data, lowcut, highcut, fs, order=5):
-        """Applies a band-pass filter to the data."""
+        """Applies a band-pass filter."""
         nyq = 0.5 * fs
         low = lowcut / nyq
         high = highcut / nyq
@@ -193,10 +186,11 @@ class AudioPipeline:
         """Stops the recording and saves the file."""
         if not self.is_recording: return
         self.is_recording = False
-        self.recording_thread.join()
+        if self.recording_thread:
+            self.recording_thread.join()
 
     def _write_recording(self):
-        """Worker thread function to write audio data from the queue to a WAV file."""
+        """Worker thread function to write audio data to a WAV file."""
         with sf.SoundFile(self.recording_filename, mode='w', samplerate=self.sample_rate, channels=1) as audio_file:
             while self.is_recording or not self.recording_queue.empty():
                 try:
