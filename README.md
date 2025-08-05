@@ -79,18 +79,32 @@ pip install -r requirements.txt
 
 ##  File Structure
 
-```
-awedeeoh/
-├── main.py                 # Launches GUI + main loop
-├── audio_pipeline.py       # DSP: compression, filtering, gain
-├── device_manager.py       # Input/output device selection
-├── nlp_listener.py         # Vosk voice recognition module
-├── presets/
-│   ├── whisper_boost.json  # Whisper enhancement preset
-│   └── ...                 # User-defined profiles
-├── recordings/             # Saved output audio
-```
+```awedeeoh/
+│
+├── main.py                 # Launches the GUI and main application loop
+├── audio_pipeline.py       # Core DSP functions: compression, filtering, gain
+├── device_manager.py       # Handles detection of audio I/O devices
+├── nlp_listener.py         # Manages voice recognition thread
+│
+├── install.sh              # Installer script for macOS / Linux
+├── install.bat             # Installer script for Windows
+├── requirements.txt        # List of Python dependencies
+├── README.md               # Project documentation (this file)
+├── index.html              # Optional project webpage
+│
+├── presets/                # Directory for saved setting profiles
+│   ├── whisper_boost.json
+│   ├── heartbeat_detector.json
+│   ├── military_intercept.json
+│   ├── hearing_accessibility.json
+│   ├── superhuman.json
+│   ├── paw_steps.json
+│   └── ...
+│
+├── recordings/             # Default directory for saved .wav files
+│   └── (empty by default)
+│
+└── model/                  # Directory for the Vosk NLP model
+    └── (empty by default)  # (Downloaded on first run of voice control)
 
----
-
-Let me know if you want a sample `whisper_boost.json` preset or integration tips.
+--
