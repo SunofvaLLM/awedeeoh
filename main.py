@@ -48,17 +48,16 @@ class WebSocketServer(QObject):
             await asyncio.wait([client.send(json_message) for client in self.clients])
 
     def run(self):
-        """Starts the WebSocket server."""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+    """Starts the WebSocket server in an event loop."""
+    async def start_server():
+        async with websockets.serve(self.handler, self.host, self.port):
+            print(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+            await asyncio.Future()  # run forever
 
-        start_server_coroutine = websockets.serve(self.handler, self.host, self.port)
-
-        server = self.loop.run_until_complete(start_server_coroutine)
-
-        print(f"Starting WebSocket server on ws://{self.host}:{self.port}")
-        
-        self.loop.run_forever()
+    self.loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(self.loop)
+    self.loop.run_until_complete(start_server())
+    self.loop.run_forever()
 
 class AwedeeohController(QObject):
     """
