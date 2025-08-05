@@ -1,4 +1,7 @@
-sounddevice
-numpy 
-scipy 
 pyaudio
+numpy
+scipy
+soundfile
+PyQt5
+sounddevice
+# vosk # Not used in this version, but ready for later
