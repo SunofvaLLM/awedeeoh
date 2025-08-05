@@ -1,206 +1,207 @@
-import sys
-import os
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QComboBox, QLabel, QSlider, QCheckBox, QGroupBox,
-    QMessageBox
-)
-from PyQt5.QtCore import Qt, QCoreApplication
+import pyaudio
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+from scipy.signal import butter, lfilter
+import threading
+import queue
 
-# --- Import custom modules ---
-# Ensure these files are in the same directory or in the python path
-from device_manager import DeviceManager
-from audio_pipeline import AudioPipeline
-
-class SuperHearingApp(QMainWindow):
+class AudioPipeline:
     """
-    The main application window for SuperHearing-X.
-    It provides a GUI to control the audio pipeline.
+    Manages the real-time audio processing pipeline with advanced "Super Hearing" features.
+    Includes a stateful compressor with attack/release and a final brickwall limiter.
     """
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("SuperHearing-X")
-        self.setGeometry(100, 100, 500, 400)
-
-        # --- Initialize backend components ---
-        self.device_manager = DeviceManager()
-        self.audio_pipeline = None
-
-        # --- Store device info ---
-        self.input_devices = self.device_manager.get_input_devices()
-        self.output_devices = self.device_manager.get_output_devices()
-
-        # --- Initialize UI ---
-        self.initUI()
+    def __init__(self, input_device_index, output_device_index, sample_rate=44100, chunk_size=1024):
+        self.input_device_index = input_device_index
+        self.output_device_index = output_device_index
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
         
-        # Set a flag to check if we are exiting
-        self._is_exiting = False
+        self.stream = None
+        self.is_running = False
+        self.lock = threading.Lock()
 
-    def initUI(self):
-        """Sets up the user interface."""
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        # --- Audio Enhancement Parameters ---
+        self.gain_db = 10.0
+        self.noise_gate_threshold = 0.01
 
-        # --- Device Selection Group ---
-        device_group = QGroupBox("Audio Devices")
-        device_layout = QVBoxLayout()
+        # --- Super Hearing Parameters ---
+        self.compressor_enabled = True
+        self.compressor_threshold_db = -50.0 # dBFS
+        self.compressor_ratio = 8.0 # 8:1 ratio
+        self.compressor_attack_ms = 5.0 # Time to react
+        self.compressor_release_ms = 100.0 # Time to recover
+        # Internal state for the compressor
+        self._compressor_gain_reduction = 1.0 
+
+        self.speech_focus_enabled = False
+        self.band_pass_low_cutoff = 300.0 # Hz
+        self.band_pass_high_cutoff = 3400.0 # Hz
         
-        # Input Device
-        self.input_combo = QComboBox()
-        self.input_combo.addItems(self.input_devices.values())
-        default_input_idx = self.device_manager.get_default_input_device_index()
-        if default_input_idx in self.input_devices:
-            self.input_combo.setCurrentText(self.input_devices[default_input_idx])
+        self.limiter_enabled = True
+        self.limiter_threshold_db = -1.0 # dBFS
+
+        # --- Recording State ---
+        self.is_recording = False
+        self.recording_queue = queue.Queue()
+        self.recording_thread = None
+        self.recording_filename = "recordings/captured.wav"
+
+    def _audio_callback(self, indata, outdata, frames, time, status):
+        """This function is called for each audio block."""
+        if status:
+            print(status)
         
-        # Output Device
-        self.output_combo = QComboBox()
-        self.output_combo.addItems(self.output_devices.values())
-        default_output_idx = self.device_manager.get_default_output_device_index()
-        if default_output_idx in self.output_devices:
-            self.output_combo.setCurrentText(self.output_devices[default_output_idx])
-
-        device_layout.addWidget(QLabel("Input Microphone:"))
-        device_layout.addWidget(self.input_combo)
-        device_layout.addWidget(QLabel("Output Headphones/Speakers:"))
-        device_layout.addWidget(self.output_combo)
-        device_group.setLayout(device_layout)
-        main_layout.addWidget(device_group)
-
-        # --- Main Controls ---
-        control_layout = QHBoxLayout()
-        self.listen_button = QPushButton("Start Listening")
-        self.listen_button.setCheckable(True)
-        self.listen_button.clicked.connect(self.toggle_listening)
-        control_layout.addWidget(self.listen_button)
-
-        self.record_button = QPushButton("Record")
-        self.record_button.setCheckable(True)
-        self.record_button.setEnabled(False) # Disabled until listening starts
-        self.record_button.clicked.connect(self.toggle_recording)
-        control_layout.addWidget(self.record_button)
-        main_layout.addLayout(control_layout)
-
-        # --- Enhancements Group ---
-        enhancements_group = QGroupBox("Audio Enhancements")
-        enhancements_layout = QVBoxLayout()
-
-        # Gain Slider
-        gain_layout = QHBoxLayout()
-        gain_layout.addWidget(QLabel("Gain (dB):"))
-        self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setRange(0, 40) # 0 to 40 dB
-        self.gain_slider.setValue(10)
-        self.gain_slider.valueChanged.connect(self.update_gain)
-        self.gain_label = QLabel(f"{self.gain_slider.value()} dB")
-        gain_layout.addWidget(self.gain_slider)
-        gain_layout.addWidget(self.gain_label)
-        enhancements_layout.addLayout(gain_layout)
-
-        # Whisper Boost Checkbox
-        self.whisper_boost_checkbox = QCheckBox("Enable Whisper Boost")
-        self.whisper_boost_checkbox.toggled.connect(self.update_whisper_boost)
-        enhancements_layout.addWidget(self.whisper_boost_checkbox)
-        
-        enhancements_group.setLayout(enhancements_layout)
-        main_layout.addWidget(enhancements_group)
-
-        # --- Status Bar ---
-        self.status_label = QLabel("Status: Stopped")
-        main_layout.addWidget(self.status_label)
-
-        main_layout.addStretch()
-
-    def toggle_listening(self):
-        """Starts or stops the audio pipeline."""
-        if self.listen_button.isChecked():
-            # --- Start Listening ---
-            try:
-                selected_input_name = self.input_combo.currentText()
-                selected_output_name = self.output_combo.currentText()
-                
-                # Find the device index from its name
-                input_idx = next(k for k, v in self.input_devices.items() if v == selected_input_name)
-                output_idx = next(k for k, v in self.output_devices.items() if v == selected_output_name)
-
-                self.audio_pipeline = AudioPipeline(input_idx, output_idx)
-                
-                # Apply current GUI settings to the new pipeline instance
-                self.update_gain()
-                self.update_whisper_boost()
-                
-                self.audio_pipeline.start()
-                
-                if not self.audio_pipeline.is_running:
-                    raise RuntimeError("Failed to start audio stream. Check console for errors.")
-
-                self.listen_button.setText("Stop Listening")
-                self.status_label.setText("Status: Listening")
-                self.record_button.setEnabled(True)
-                self.input_combo.setEnabled(False)
-                self.output_combo.setEnabled(False)
-
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Could not start audio stream:\n{e}")
-                self.listen_button.setChecked(False)
-                self.audio_pipeline = None
-        else:
-            # --- Stop Listening ---
-            if self.audio_pipeline:
-                self.audio_pipeline.stop()
-                self.audio_pipeline = None
+        with self.lock:
+            processed_data = self.process_frame(indata.copy())
+            outdata[:] = processed_data
             
-            self.listen_button.setText("Start Listening")
-            self.status_label.setText("Status: Stopped")
-            self.record_button.setEnabled(False)
-            self.record_button.setChecked(False) # Uncheck record button if it was on
-            self.input_combo.setEnabled(True)
-            self.output_combo.setEnabled(True)
+            if self.is_recording:
+                self.recording_queue.put(processed_data.copy())
 
-    def toggle_recording(self):
-        """Starts or stops recording the audio."""
-        if self.record_button.isChecked():
-            if self.audio_pipeline:
-                self.audio_pipeline.start_recording()
-                self.record_button.setText("Stop Recording")
-                self.status_label.setText("Status: Recording...")
-        else:
-            if self.audio_pipeline:
-                self.audio_pipeline.stop_recording()
-                self.record_button.setText("Record")
-                self.status_label.setText("Status: Listening")
+    def process_frame(self, data):
+        """Applies all enabled audio enhancements to a frame."""
+        audio_data = data.astype(np.float32)
 
+        # 1. Noise Gate
+        if self.noise_gate_threshold > 0:
+            audio_data[np.abs(audio_data) < self.noise_gate_threshold] = 0.0
 
-    def update_gain(self):
-        """Updates the gain in the audio pipeline."""
-        gain_val = self.gain_slider.value()
-        self.gain_label.setText(f"{gain_val} dB")
-        if self.audio_pipeline:
-            with self.audio_pipeline.lock:
-                self.audio_pipeline.gain_db = float(gain_val)
-
-    def update_whisper_boost(self):
-        """Updates the whisper boost setting in the pipeline."""
-        is_enabled = self.whisper_boost_checkbox.isChecked()
-        if self.audio_pipeline:
-            with self.audio_pipeline.lock:
-                self.audio_pipeline.whisper_boost_enabled = is_enabled
-    
-    def closeEvent(self, event):
-        """Ensures the audio stream is stopped when the app closes."""
-        self._is_exiting = True
-        if self.audio_pipeline and self.audio_pipeline.is_running:
-            print("Closing: Stopping audio pipeline...")
-            self.audio_pipeline.stop()
-        event.accept()
-
-
-if __name__ == '__main__':
-    # Ensure recordings directory exists
-    if not os.path.exists('recordings'):
-        os.makedirs('recordings')
+        # 2. Gain / Amplification
+        gain_factor = 10**(self.gain_db / 20.0)
+        audio_data *= gain_factor
         
-    app = QApplication(sys.argv)
-    main_win = SuperHearingApp()
-    main_win.show()
-    sys.exit(app.exec_())
+        # 3. Speech Focus Filter (Band-pass)
+        if self.speech_focus_enabled:
+            audio_data = self._band_pass_filter(
+                audio_data, 
+                self.band_pass_low_cutoff, 
+                self.band_pass_high_cutoff, 
+                self.sample_rate
+            )
+
+        # 4. Super Hearing Compressor
+        if self.compressor_enabled:
+            audio_data = self._dynamic_range_compressor_stateful(
+                audio_data
+            )
+
+        # 5. Brickwall Limiter (Final Stage)
+        if self.limiter_enabled:
+            audio_data = self._limiter(audio_data, self.limiter_threshold_db)
+
+        # Clamp to prevent clipping (final safety net)
+        np.clip(audio_data, -1.0, 1.0, out=audio_data)
+        
+        return audio_data
+
+    def _dynamic_range_compressor_stateful(self, data):
+        """
+        Applies compression with attack and release times for smoother gain reduction.
+        This method is stateful and processes the audio sample by sample.
+        """
+        if self.compressor_ratio <= 1:
+            return data
+
+        # Calculate attack and release coefficients based on sample rate
+        # These determine how many samples it takes to reach the target gain
+        attack_coeff = np.exp(-1.0 / (self.sample_rate * (self.compressor_attack_ms / 1000.0)))
+        release_coeff = np.exp(-1.0 / (self.sample_rate * (self.compressor_release_ms / 1000.0)))
+        
+        threshold_linear = 10**(self.compressor_threshold_db / 20.0)
+        processed_data = np.zeros_like(data)
+
+        # Process sample by sample to correctly model attack/release
+        for i, sample in enumerate(data):
+            # Determine if the sample is above the threshold
+            if abs(sample) > threshold_linear:
+                # Calculate the target gain reduction
+                target_gain = (threshold_linear + (abs(sample) - threshold_linear) / self.compressor_ratio) / abs(sample)
+                # Move towards the target gain using the attack coefficient
+                self._compressor_gain_reduction = (attack_coeff * self._compressor_gain_reduction) + (1 - attack_coeff) * target_gain
+            else:
+                # If below threshold, move back towards 1.0 (no gain reduction)
+                self._compressor_gain_reduction = (release_coeff * self._compressor_gain_reduction) + (1 - release_coeff) * 1.0
+            
+            # Apply the calculated gain reduction to the sample
+            processed_data[i] = sample * self._compressor_gain_reduction
+            
+        return processed_data
+
+    def _limiter(self, data, threshold_db):
+        """Applies a hard brickwall limiter to prevent clipping."""
+        threshold_linear = 10**(threshold_db / 20.0)
+        
+        # Find samples that exceed the limiter threshold
+        clipping_mask = np.abs(data) > threshold_linear
+        
+        # For those samples, reduce their amplitude to the threshold
+        # while preserving their sign.
+        data[clipping_mask] = np.sign(data[clipping_mask]) * threshold_linear
+        
+        return data
+
+    def _band_pass_filter(self, data, lowcut, highcut, fs, order=5):
+        """Applies a band-pass filter to the data."""
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
+        b, a = butter(order, [low, high], btype='band')
+        y = lfilter(b, a, data, axis=0)
+        return y
+
+    def start(self):
+        """Starts the audio stream."""
+        if self.is_running: return
+        self.is_running = True
+        try:
+            self.stream = sd.Stream(
+                samplerate=self.sample_rate,
+                blocksize=self.chunk_size,
+                device=(self.input_device_index, self.output_device_index),
+                channels=1,
+                dtype='float32',
+                callback=self._audio_callback
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"Error starting audio stream: {e}")
+            self.is_running = False
+
+    def stop(self):
+        """Stops the audio stream."""
+        if not self.is_running: return
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        self.is_running = False
+        self.stream = None
+        if self.is_recording:
+            self.stop_recording()
+
+    def start_recording(self, filename="recordings/captured.wav"):
+        """Starts recording the processed audio."""
+        if self.is_recording: return
+        self.recording_filename = filename
+        import os
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        self.is_recording = True
+        self.recording_thread = threading.Thread(target=self._write_recording)
+        self.recording_thread.start()
+
+    def stop_recording(self):
+        """Stops the recording and saves the file."""
+        if not self.is_recording: return
+        self.is_recording = False
+        self.recording_thread.join()
+
+    def _write_recording(self):
+        """Worker thread function to write audio data from the queue to a WAV file."""
+        with sf.SoundFile(self.recording_filename, mode='w', samplerate=self.sample_rate, channels=1) as audio_file:
+            while self.is_recording or not self.recording_queue.empty():
+                try:
+                    data = self.recording_queue.get(timeout=1)
+                    audio_file.write(data)
+                except queue.Empty:
+                    if not self.is_recording:
+                        break
