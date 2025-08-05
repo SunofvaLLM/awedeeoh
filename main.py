@@ -1,323 +1,259 @@
 import sys
 import os
+import asyncio
+import websockets
 import json
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QComboBox, QLabel, QSlider, QCheckBox, QGroupBox,
-    QMessageBox, QFileDialog
-)
-from PyQt5.QtCore import Qt, pyqtSlot
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QThread, pyqtSignal, QObject, pyqtSlot
 
-# --- Import custom modules ---
 from device_manager import DeviceManager
 from audio_pipeline import AudioPipeline
 from nlp_listener import NLPListener
 
-class SuperHearingApp(QMainWindow):
+class WebSocketServer(QObject):
     """
-    The main application window for SuperHearing-X, fully aligned with the
-    advanced audio pipeline, including compressor and limiter controls.
+    A WebSocket server that runs in a separate thread to handle
+    communication with the web UI.
+    """
+    command_received = pyqtSignal(dict)
+    
+    def __init__(self, host='localhost', port=8765):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.clients = set()
+        self.loop = None
+
+    async def handler(self, websocket, path):
+        """Handles incoming WebSocket connections."""
+        self.clients.add(websocket)
+        print(f"Web client connected: {websocket.remote_address}")
+        try:
+            # Send initial device list upon connection
+            self.command_received.emit({'action': 'get_devices'})
+            async for message in websocket:
+                data = json.loads(message)
+                # print(f"Received from web UI: {data}") # Uncomment for debugging
+                self.command_received.emit(data)
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Web client disconnected: {websocket.remote_address}")
+        finally:
+            self.clients.remove(websocket)
+
+    async def send_to_all(self, message):
+        """Sends a message to all connected clients."""
+        if self.clients:
+            # Ensure message is a JSON string
+            json_message = json.dumps(message)
+            await asyncio.wait([client.send(json_message) for client in self.clients])
+
+    def run(self):
+        """Starts the WebSocket server."""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        start_server = websockets.serve(self.handler, self.host, self.port)
+        
+        self.loop.run_until_complete(start_server)
+        print(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+        self.loop.run_forever()
+
+
+class AwedeeohController(QObject):
+    """
+    Main controller for the Awedeeoh application.
+    Manages the backend logic and communicates with the WebSocket server.
     """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SuperHearing-X")
-        self.setGeometry(100, 100, 550, 650) # Increased height for new controls
-
         self.device_manager = DeviceManager()
         self.audio_pipeline = None
         self.nlp_listener = None
-
-        self.input_devices = self.device_manager.get_input_devices()
-        self.output_devices = self.device_manager.get_output_devices()
-
-        self.initUI()
-        self._is_exiting = False
-
-    def initUI(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-
-        # --- Device Selection ---
-        device_group = QGroupBox("Audio Devices")
-        device_layout = QVBoxLayout()
-        self.input_combo = QComboBox()
-        self.input_combo.addItems(self.input_devices.values())
-        default_input_idx = self.device_manager.get_default_input_device_index()
-        if default_input_idx in self.input_devices:
-            self.input_combo.setCurrentText(self.input_devices[default_input_idx])
-        self.output_combo = QComboBox()
-        self.output_combo.addItems(self.output_devices.values())
-        default_output_idx = self.device_manager.get_default_output_device_index()
-        if default_output_idx in self.output_devices:
-            self.output_combo.setCurrentText(self.output_devices[default_output_idx])
-        device_layout.addWidget(QLabel("Input Microphone:"))
-        device_layout.addWidget(self.input_combo)
-        device_layout.addWidget(QLabel("Output Headphones/Speakers:"))
-        device_layout.addWidget(self.output_combo)
-        device_group.setLayout(device_layout)
-        main_layout.addWidget(device_group)
-
-        # --- Main Controls ---
-        control_layout = QHBoxLayout()
-        self.listen_button = QPushButton("Start Listening")
-        self.listen_button.setCheckable(True)
-        self.listen_button.clicked.connect(self.toggle_listening)
-        control_layout.addWidget(self.listen_button)
-        self.record_button = QPushButton("Record")
-        self.record_button.setCheckable(True)
-        self.record_button.setEnabled(False)
-        self.record_button.clicked.connect(self.toggle_recording)
-        control_layout.addWidget(self.record_button)
-        main_layout.addLayout(control_layout)
-
-        # --- Super Hearing Controls ---
-        super_hearing_group = QGroupBox("Super Hearing Compressor")
-        super_hearing_layout = QVBoxLayout()
-
-        # Compressor Threshold
-        threshold_layout = QHBoxLayout()
-        threshold_layout.addWidget(QLabel("Threshold (dB):"))
-        self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setRange(-80, 0)
-        self.threshold_slider.setValue(-50)
-        self.threshold_slider.valueChanged.connect(self.update_super_hearing_settings)
-        self.threshold_label = QLabel(f"{self.threshold_slider.value()} dB")
-        threshold_layout.addWidget(self.threshold_slider)
-        threshold_layout.addWidget(self.threshold_label)
-        super_hearing_layout.addLayout(threshold_layout)
-
-        # Compressor Ratio
-        ratio_layout = QHBoxLayout()
-        ratio_layout.addWidget(QLabel("Ratio:"))
-        self.ratio_slider = QSlider(Qt.Horizontal)
-        self.ratio_slider.setRange(1, 20)
-        self.ratio_slider.setValue(8)
-        self.ratio_slider.valueChanged.connect(self.update_super_hearing_settings)
-        self.ratio_label = QLabel(f"{self.ratio_slider.value()}:1")
-        ratio_layout.addWidget(self.ratio_slider)
-        ratio_layout.addWidget(self.ratio_label)
-        super_hearing_layout.addLayout(ratio_layout)
-
-        # Compressor Attack
-        attack_layout = QHBoxLayout()
-        attack_layout.addWidget(QLabel("Attack (ms):"))
-        self.attack_slider = QSlider(Qt.Horizontal)
-        self.attack_slider.setRange(1, 100)
-        self.attack_slider.setValue(5)
-        self.attack_slider.valueChanged.connect(self.update_super_hearing_settings)
-        self.attack_label = QLabel(f"{self.attack_slider.value()} ms")
-        attack_layout.addWidget(self.attack_slider)
-        attack_layout.addWidget(self.attack_label)
-        super_hearing_layout.addLayout(attack_layout)
-
-        # Compressor Release
-        release_layout = QHBoxLayout()
-        release_layout.addWidget(QLabel("Release (ms):"))
-        self.release_slider = QSlider(Qt.Horizontal)
-        self.release_slider.setRange(10, 500)
-        self.release_slider.setValue(100)
-        self.release_slider.valueChanged.connect(self.update_super_hearing_settings)
-        self.release_label = QLabel(f"{self.release_slider.value()} ms")
-        release_layout.addWidget(self.release_slider)
-        release_layout.addWidget(self.release_label)
-        super_hearing_layout.addLayout(release_layout)
+        self.current_settings = {} 
         
-        # Speech Focus
-        self.speech_focus_checkbox = QCheckBox("Enable Speech Focus (300-3400Hz Filter)")
-        self.speech_focus_checkbox.toggled.connect(self.update_super_hearing_settings)
-        super_hearing_layout.addWidget(self.speech_focus_checkbox)
-        
-        super_hearing_group.setLayout(super_hearing_layout)
-        main_layout.addWidget(super_hearing_group)
+        # WebSocket Server Setup
+        self.ws_server = WebSocketServer()
+        self.ws_thread = QThread()
+        self.ws_server.moveToThread(self.ws_thread)
+        self.ws_thread.started.connect(self.ws_server.run)
+        self.ws_server.command_received.connect(self.handle_ws_command)
+        self.ws_thread.start()
 
-        # --- Final Output Controls ---
-        output_group = QGroupBox("Final Output Controls")
-        output_layout = QVBoxLayout()
-        
-        # General Gain
-        gain_layout = QHBoxLayout()
-        gain_layout.addWidget(QLabel("Makeup Gain (dB):"))
-        self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setRange(0, 40)
-        self.gain_slider.setValue(10)
-        self.gain_slider.valueChanged.connect(self.update_gain)
-        self.gain_label = QLabel(f"{self.gain_slider.value()} dB")
-        gain_layout.addWidget(self.gain_slider)
-        gain_layout.addWidget(self.gain_label)
-        output_layout.addLayout(gain_layout)
+        # NLP Listener Setup
+        self.nlp_thread = QThread()
 
-        # Limiter
-        limiter_layout = QHBoxLayout()
-        self.limiter_checkbox = QCheckBox("Enable Brickwall Limiter")
-        self.limiter_checkbox.setChecked(True)
-        self.limiter_checkbox.toggled.connect(self.update_super_hearing_settings)
-        limiter_layout.addWidget(self.limiter_checkbox)
-        output_layout.addLayout(limiter_layout)
-        
-        output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
+    @pyqtSlot(dict)
+    def handle_ws_command(self, data):
+        """Processes commands received from the WebSocket server."""
+        action = data.get('action')
 
-        # --- Presets & Voice Control ---
-        bottom_controls_layout = QHBoxLayout()
-        preset_group = QGroupBox("Presets")
-        preset_layout = QHBoxLayout()
-        self.load_preset_button = QPushButton("Load")
-        self.load_preset_button.clicked.connect(self.load_preset)
-        self.save_preset_button = QPushButton("Save")
-        self.save_preset_button.clicked.connect(self.save_preset)
-        preset_layout.addWidget(self.load_preset_button)
-        preset_layout.addWidget(self.save_preset_button)
-        
-        nlp_group = QGroupBox("Voice")
-        nlp_layout = QHBoxLayout()
-        self.nlp_toggle_checkbox = QCheckBox("On/Off")
-        self.nlp_toggle_checkbox.toggled.connect(self.toggle_nlp_listener)
-        nlp_layout.addWidget(self.nlp_toggle_checkbox)
-        
-        bottom_controls_layout.addWidget(preset_group)
-        bottom_controls_layout.addWidget(nlp_group)
-        main_layout.addLayout(bottom_controls_layout)
+        if action == 'get_devices':
+            self.send_device_list()
+        elif action == 'start_listening':
+            self.current_settings.update(data)
+            self.start_listening()
+        elif action == 'stop_listening':
+            self.stop_listening()
+        elif action == 'update_settings':
+            self.current_settings.update(data)
+            self.update_pipeline_settings()
+        elif action == 'start_recording':
+            if self.audio_pipeline: self.audio_pipeline.start_recording()
+        elif action == 'stop_recording':
+            if self.audio_pipeline: self.audio_pipeline.stop_recording()
+        elif action == 'load_preset':
+            self.load_preset(data.get('preset_name'))
+        elif action == 'toggle_voice_control':
+            self.toggle_nlp_listener(data.get('enabled'))
 
-        self.status_label = QLabel("Status: Stopped")
-        main_layout.addWidget(self.status_label)
-        main_layout.addStretch()
+    def send_message_to_ui(self, message):
+        """Thread-safe method to send a message to the UI."""
+        if self.ws_server.loop and self.ws_server.loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.ws_server.send_to_all(message), self.ws_server.loop)
 
-    def update_gain(self):
-        gain_val = self.gain_slider.value()
-        self.gain_label.setText(f"{gain_val} dB")
+    def send_device_list(self):
+        """Sends the list of audio devices to the web UI."""
+        input_devices = self.device_manager.get_input_devices()
+        output_devices = self.device_manager.get_output_devices()
+        message = {
+            'type': 'device_list',
+            'input_devices': input_devices,
+            'output_devices': output_devices
+        }
+        self.send_message_to_ui(message)
+        
+    def start_listening(self):
+        """Starts the audio pipeline based on current settings."""
+        if self.audio_pipeline and self.audio_pipeline.is_running: return
+            
+        try:
+            input_idx = int(self.current_settings.get('input_device', -1))
+            output_idx = int(self.current_settings.get('output_device', -1))
+
+            if input_idx == -1 or output_idx == -1:
+                print("Error: Input or output device not selected.")
+                return
+
+            self.audio_pipeline = AudioPipeline(input_idx, output_idx)
+            self.update_pipeline_settings()
+            self.audio_pipeline.start()
+            self.send_status_update()
+        except Exception as e:
+            print(f"Error starting audio stream: {e}")
+
+    def stop_listening(self):
+        """Stops the audio pipeline."""
         if self.audio_pipeline:
-            with self.audio_pipeline.lock:
-                self.audio_pipeline.gain_db = float(gain_val)
-    
-    def update_super_hearing_settings(self):
-        """Updates all advanced settings in the audio pipeline."""
-        threshold_val = self.threshold_slider.value()
-        self.threshold_label.setText(f"{threshold_val} dB")
+            self.audio_pipeline.stop()
+            self.audio_pipeline = None
+        self.send_status_update()
         
-        ratio_val = self.ratio_slider.value()
-        self.ratio_label.setText(f"{ratio_val}:1")
+    def update_pipeline_settings(self):
+        """Updates the audio pipeline with new settings from the UI."""
+        if not self.audio_pipeline or not self.current_settings: return
 
-        attack_val = self.attack_slider.value()
-        self.attack_label.setText(f"{attack_val} ms")
+        with self.audio_pipeline.lock:
+            # Map UI controls to pipeline attributes
+            comp_settings = self.current_settings.get('compressor', {})
+            self.audio_pipeline.compressor_threshold_db = float(comp_settings.get('threshold', -50))
+            self.audio_pipeline.compressor_ratio = float(comp_settings.get('ratio', 8))
+            self.audio_pipeline.compressor_attack_ms = float(comp_settings.get('attack', 5))
+            self.audio_pipeline.compressor_release_ms = float(comp_settings.get('release', 100))
+            
+            # Note: The raw input/output volume is typically an OS-level setting.
+            # We will use the "sensitivity" and "gain" sliders as pre- and post-pipeline gain stages.
+            self.audio_pipeline.input_gain_db = float(self.current_settings.get('mic_sensitivity', 0))
+            self.audio_pipeline.output_gain_db = float(self.current_settings.get('output_gain', 0))
+            
+            # The main "makeup_gain" is the final gain stage in the pipeline
+            self.audio_pipeline.gain_db = float(self.current_settings.get('makeup_gain', 10))
+            
+            self.audio_pipeline.speech_focus_enabled = bool(self.current_settings.get('speech_focus', False))
+            self.audio_pipeline.limiter_enabled = bool(self.current_settings.get('limiter', True))
 
-        release_val = self.release_slider.value()
-        self.release_label.setText(f"{release_val} ms")
+    def load_preset(self, preset_name):
+        """Loads a preset from a file, applies its settings, and updates the UI."""
+        if not preset_name: return
+        
+        safe_name = preset_name.replace(" ", "_").lower()
+        filename = f"presets/{safe_name}.json"
+        
+        if not os.path.exists(filename):
+            print(f"Error: Preset file not found at {filename}")
+            return
 
-        if self.audio_pipeline:
-            with self.audio_pipeline.lock:
-                self.audio_pipeline.compressor_threshold_db = float(threshold_val)
-                self.audio_pipeline.compressor_ratio = float(ratio_val)
-                self.audio_pipeline.compressor_attack_ms = float(attack_val)
-                self.audio_pipeline.compressor_release_ms = float(release_val)
-                self.audio_pipeline.speech_focus_enabled = self.speech_focus_checkbox.isChecked()
-                self.audio_pipeline.limiter_enabled = self.limiter_checkbox.isChecked()
-    
-    def apply_current_settings_to_pipeline(self):
-        """Applies all GUI settings to the audio pipeline instance."""
-        self.update_gain()
-        self.update_super_hearing_settings()
+        try:
+            with open(filename, 'r') as f:
+                preset_settings = json.load(f)
+            
+            # Send the loaded settings to the UI so it can update the sliders/checkboxes
+            message = {'type': 'settings_update', 'settings': preset_settings}
+            self.send_message_to_ui(message)
+            
+            # Apply settings to the backend
+            self.current_settings.update(preset_settings)
+            self.update_pipeline_settings()
+            print(f"Loaded preset: {preset_name}")
 
-    def toggle_listening(self):
-        if self.listen_button.isChecked():
-            try:
-                selected_input_name = self.input_combo.currentText()
-                selected_output_name = self.output_combo.currentText()
-                input_idx = next(k for k, v in self.input_devices.items() if v == selected_input_name)
-                output_idx = next(k for k, v in self.output_devices.items() if v == selected_output_name)
+        except Exception as e:
+            print(f"Error loading preset {preset_name}: {e}")
 
-                self.audio_pipeline = AudioPipeline(input_idx, output_idx)
-                self.apply_current_settings_to_pipeline()
-                self.audio_pipeline.start()
-                if not self.audio_pipeline.is_running:
-                    raise RuntimeError("Failed to start audio stream.")
+    def toggle_nlp_listener(self, enabled):
+        """Starts or stops the NLP listener."""
+        if enabled:
+            if self.nlp_listener and self.nlp_listener.is_running: return
+            
+            input_idx = int(self.current_settings.get('input_device', -1))
+            if input_idx == -1:
+                print("Cannot start voice control without a selected input device.")
+                # Optionally send an error message back to the UI
+                return
 
-                self.listen_button.setText("Stop Listening")
-                self.status_label.setText("Status: Listening")
-                self.record_button.setEnabled(True)
-                self.input_combo.setEnabled(False)
-                self.output_combo.setEnabled(False)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Could not start audio stream:\n{e}")
-                self.listen_button.setChecked(False)
+            self.nlp_listener = NLPListener(device_index=input_idx)
+            self.nlp_listener.moveToThread(self.nlp_thread)
+            self.nlp_thread.started.connect(self.nlp_listener.run)
+            self.nlp_listener.command_recognized.connect(self.handle_voice_command)
+            self.nlp_thread.start()
+            print("Voice control activated.")
         else:
-            if self.audio_pipeline:
-                self.audio_pipeline.stop()
-                self.audio_pipeline = None
-            self.listen_button.setText("Start Listening")
-            self.status_label.setText("Status: Stopped")
-            self.record_button.setEnabled(False)
-            self.record_button.setChecked(False)
-            self.input_combo.setEnabled(True)
-            self.output_combo.setEnabled(True)
-
-    def save_preset(self):
-        presets_dir = 'presets'
-        os.makedirs(presets_dir, exist_ok=True)
-        fileName, _ = QFileDialog.getSaveFileName(self, "Save Preset", presets_dir, "JSON Files (*.json)")
-        if fileName:
-            if not fileName.endswith('.json'): fileName += '.json'
-            settings = {
-                "gain_db": self.gain_slider.value(),
-                "compressor_threshold_db": self.threshold_slider.value(),
-                "compressor_ratio": self.ratio_slider.value(),
-                "compressor_attack_ms": self.attack_slider.value(),
-                "compressor_release_ms": self.release_slider.value(),
-                "speech_focus_enabled": self.speech_focus_checkbox.isChecked(),
-                "limiter_enabled": self.limiter_checkbox.isChecked(),
-            }
-            with open(fileName, 'w') as f: json.dump(settings, f, indent=4)
-            QMessageBox.information(self, "Success", f"Preset saved to '{os.path.basename(fileName)}'.")
-
-    def load_preset(self, filename=None):
-        if not filename:
-            presets_dir = 'presets'
-            os.makedirs(presets_dir, exist_ok=True)
-            filename, _ = QFileDialog.getOpenFileName(self, "Load Preset", presets_dir, "JSON Files (*.json)")
-        if filename and os.path.exists(filename):
-            with open(filename, 'r') as f: settings = json.load(f)
-            self.apply_settings_from_preset(settings)
-            QMessageBox.information(self, "Success", f"Preset '{os.path.basename(filename)}' loaded.")
-
-    def apply_settings_from_preset(self, settings):
-        self.gain_slider.setValue(settings.get("gain_db", 10))
-        self.threshold_slider.setValue(settings.get("compressor_threshold_db", -50))
-        self.ratio_slider.setValue(settings.get("compressor_ratio", 8))
-        self.attack_slider.setValue(settings.get("compressor_attack_ms", 5))
-        self.release_slider.setValue(settings.get("compressor_release_ms", 100))
-        self.speech_focus_checkbox.setChecked(settings.get("speech_focus_enabled", False))
-        self.limiter_checkbox.setChecked(settings.get("limiter_enabled", True))
-        self.apply_current_settings_to_pipeline()
-
-    def closeEvent(self, event):
-        self._is_exiting = True
-        if self.nlp_listener: self.nlp_listener.stop()
-        if self.audio_pipeline: self.audio_pipeline.stop()
-        event.accept()
-
-    # --- Dummy/Placeholder methods for functions already implemented ---
-    def toggle_recording(self):
-        """Placeholder for recording logic."""
-        if not self.audio_pipeline: return
-        QMessageBox.information(self, "Recording", "Recording functionality is connected here.")
-
-    def toggle_nlp_listener(self):
-        """Placeholder for NLP logic."""
-        if self.nlp_toggle_checkbox.isChecked():
-            QMessageBox.information(self, "NLP", "Voice control would be activated here.")
-        else:
-            QMessageBox.information(self, "NLP", "Voice control would be deactivated here.")
+            if self.nlp_listener:
+                self.nlp_listener.stop()
+                self.nlp_thread.quit()
+                self.nlp_thread.wait()
+                self.nlp_listener = None
+                print("Voice control deactivated.")
 
     @pyqtSlot(str)
     def handle_voice_command(self, command):
-        """Placeholder for handling voice commands."""
-        print(f"Voice command received: {command}")
+        """Translates a recognized voice command into a backend action."""
+        print(f"Voice command received: '{command}'")
+        # This logic mimics the original GUI app's voice commands
+        if "start listening" in command and (not self.audio_pipeline or not self.audio_pipeline.is_running):
+            self.start_listening()
+        elif "stop listening" in command and self.audio_pipeline and self.audio_pipeline.is_running:
+            self.stop_listening()
+        elif "record" in command:
+            if self.audio_pipeline: self.audio_pipeline.start_recording()
+        elif "stop recording" in command:
+            if self.audio_pipeline: self.audio_pipeline.stop_recording()
+        elif "load" in command and "preset" in command:
+            # Simple parsing, looks for a known preset name in the command
+            presets = ["whisper", "military", "accessibility", "heartbeat", "paranormal"]
+            for p in presets:
+                if p in command:
+                    self.load_preset(p)
+                    break
+
+    def send_status_update(self):
+        """Sends the current listening status to the UI."""
+        is_listening = self.audio_pipeline is not None and self.audio_pipeline.is_running
+        message = {'type': 'status_update', 'is_listening': is_listening}
+        self.send_message_to_ui(message)
 
 
 if __name__ == '__main__':
-    for directory in ['recordings', 'presets', 'model']:
-        if not os.path.exists(directory): os.makedirs(directory, exist_ok=True)
+    # We need a QApplication instance to run the QObject-based controller
     app = QApplication(sys.argv)
-    main_win = SuperHearingApp()
-    main_win.show()
+    controller = AwedeeohController()
+    print("Awedeeoh backend controller is running. Open index.html in a browser.")
     sys.exit(app.exec_())
