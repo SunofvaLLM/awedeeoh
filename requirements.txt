@@ -1,7 +1,9 @@
-pyaudio
 numpy
 scipy
+sounddevice
+pyaudio
 soundfile
 PyQt5
-sounddevice
-# vosk # Not used in this version, but ready for later
+websockets
+vosk
+requests
