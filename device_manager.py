@@ -1,90 +1,66 @@
-import pyaudio
-import sys
+import sounddevice as sd
 
 class DeviceManager:
+    """
+    Manages the detection and listing of audio I/O devices.
+    """
     def __init__(self):
-        self.p = pyaudio.PyAudio()
-        self.input_device_index = None
-        self.output_device_index = None
+        self.devices = sd.query_devices()
 
-    def list_devices(self):
-        """
-        Lists all available audio devices and marks inputs and outputs.
-        """
-        print("\n🎙️ Available Audio Devices:")
-        for i in range(self.p.get_device_count()):
-            dev = self.p.get_device_info_by_index(i)
-            label = []
-            if dev.get('maxInputChannels') > 0:
-                label.append("INPUT")
-            if dev.get('maxOutputChannels') > 0:
-                label.append("OUTPUT")
-            print(f"[{i}] {dev['name']} ({', '.join(label)})")
+    def get_input_devices(self):
+        """Returns a dictionary of available input devices."""
+        input_devices = {}
+        for i, device in enumerate(self.devices):
+            # A device is considered an input device if it has > 0 input channels
+            if device['max_input_channels'] > 0:
+                input_devices[i] = f"{device['name']}"
+        return input_devices
 
-    def choose_input_device(self):
-        """
-        Prompts user to select an input device index.
-        """
+    def get_output_devices(self):
+        """Returns a dictionary of available output devices."""
+        output_devices = {}
+        for i, device in enumerate(self.devices):
+            # A device is considered an output device if it has > 0 output channels
+            if device['max_output_channels'] > 0:
+                output_devices[i] = f"{device['name']}"
+        return output_devices
+
+    def get_default_input_device_index(self):
+        """Gets the index of the default system input device."""
         try:
-            index = int(input("\n🎧 Enter index of the INPUT device (e.g., your Yeti Mic): "))
-            dev = self.p.get_device_info_by_index(index)
-            if dev.get('maxInputChannels') < 1:
-                raise ValueError("Selected device is not an input device.")
-            self.input_device_index = index
-            print(f"✅ Selected INPUT device: {dev['name']}")
-        except Exception as e:
-            print(f"❌ Error selecting input device: {e}")
-            sys.exit(1)
+            return sd.default.device[0]
+        except Exception:
+            # Fallback if no default is set
+            inputs = self.get_input_devices()
+            if inputs:
+                return list(inputs.keys())[0]
+            return None
 
-    def choose_output_device(self):
-        """
-        Prompts user to select an output device index.
-        """
+
+    def get_default_output_device_index(self):
+        """Gets the index of the default system output device."""
         try:
-            index = int(input("🔊 Enter index of the OUTPUT device (e.g., your Bluetooth headphones): "))
-            dev = self.p.get_device_info_by_index(index)
-            if dev.get('maxOutputChannels') < 1:
-                raise ValueError("Selected device is not an output device.")
-            self.output_device_index = index
-            print(f"✅ Selected OUTPUT device: {dev['name']}")
-        except Exception as e:
-            print(f"❌ Error selecting output device: {e}")
-            sys.exit(1)
+            return sd.default.device[1]
+        except Exception:
+            # Fallback if no default is set
+            outputs = self.get_output_devices()
+            if outputs:
+                return list(outputs.keys())[0]
+            return None
 
-    def open_input_stream(self, rate=44100, frames_per_buffer=1024):
-        """
-        Opens the selected input stream.
-        """
-        if self.input_device_index is None:
-            raise RuntimeError("Input device not selected.")
+if __name__ == '__main__':
+    # Example usage: Print available devices
+    manager = DeviceManager()
+    
+    print("--- Input Devices ---")
+    inputs = manager.get_input_devices()
+    for index, name in inputs.items():
+        print(f"  Index {index}: {name}")
+        
+    print("\n--- Output Devices ---")
+    outputs = manager.get_output_devices()
+    for index, name in outputs.items():
+        print(f"  Index {index}: {name}")
 
-        return self.p.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=rate,
-            input=True,
-            input_device_index=self.input_device_index,
-            frames_per_buffer=frames_per_buffer
-        )
-
-    def open_output_stream(self, rate=44100, frames_per_buffer=1024):
-        """
-        Opens the selected output stream.
-        """
-        if self.output_device_index is None:
-            raise RuntimeError("Output device not selected.")
-
-        return self.p.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=rate,
-            output=True,
-            output_device_index=self.output_device_index,
-            frames_per_buffer=frames_per_buffer
-        )
-
-    def terminate(self):
-        """
-        Properly terminate the PyAudio session.
-        """
-        self.p.terminate()
+    print(f"\nDefault Input Index: {manager.get_default_input_device_index()}")
+    print(f"Default Output Index: {manager.get_default_output_device_index()}")
