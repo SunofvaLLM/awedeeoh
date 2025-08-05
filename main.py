@@ -1,9 +1,10 @@
 import sys
 import os
+import json
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QSlider, QCheckBox, QGroupBox,
-    QMessageBox
+    QMessageBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QCoreApplication
 
@@ -15,12 +16,12 @@ from audio_pipeline import AudioPipeline
 class SuperHearingApp(QMainWindow):
     """
     The main application window for SuperHearing-X.
-    It provides a GUI to control the audio pipeline.
+    It provides a GUI to control the audio pipeline and manage presets.
     """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SuperHearing-X")
-        self.setGeometry(100, 100, 500, 400)
+        self.setGeometry(100, 100, 500, 450) # Increased height for new buttons
 
         # --- Initialize backend components ---
         self.device_manager = DeviceManager()
@@ -46,14 +47,12 @@ class SuperHearingApp(QMainWindow):
         device_group = QGroupBox("Audio Devices")
         device_layout = QVBoxLayout()
         
-        # Input Device
         self.input_combo = QComboBox()
         self.input_combo.addItems(self.input_devices.values())
         default_input_idx = self.device_manager.get_default_input_device_index()
         if default_input_idx in self.input_devices:
             self.input_combo.setCurrentText(self.input_devices[default_input_idx])
         
-        # Output Device
         self.output_combo = QComboBox()
         self.output_combo.addItems(self.output_devices.values())
         default_output_idx = self.device_manager.get_default_output_device_index()
@@ -76,7 +75,7 @@ class SuperHearingApp(QMainWindow):
 
         self.record_button = QPushButton("Record")
         self.record_button.setCheckable(True)
-        self.record_button.setEnabled(False) # Disabled until listening starts
+        self.record_button.setEnabled(False) 
         self.record_button.clicked.connect(self.toggle_recording)
         control_layout.addWidget(self.record_button)
         main_layout.addLayout(control_layout)
@@ -85,11 +84,10 @@ class SuperHearingApp(QMainWindow):
         enhancements_group = QGroupBox("Audio Enhancements")
         enhancements_layout = QVBoxLayout()
 
-        # Gain Slider
         gain_layout = QHBoxLayout()
         gain_layout.addWidget(QLabel("Gain (dB):"))
         self.gain_slider = QSlider(Qt.Horizontal)
-        self.gain_slider.setRange(0, 40) # 0 to 40 dB
+        self.gain_slider.setRange(0, 40)
         self.gain_slider.setValue(10)
         self.gain_slider.valueChanged.connect(self.update_gain)
         self.gain_label = QLabel(f"{self.gain_slider.value()} dB")
@@ -97,7 +95,6 @@ class SuperHearingApp(QMainWindow):
         gain_layout.addWidget(self.gain_label)
         enhancements_layout.addLayout(gain_layout)
 
-        # Whisper Boost Checkbox
         self.whisper_boost_checkbox = QCheckBox("Enable Whisper Boost")
         self.whisper_boost_checkbox.toggled.connect(self.update_whisper_boost)
         enhancements_layout.addWidget(self.whisper_boost_checkbox)
@@ -105,30 +102,35 @@ class SuperHearingApp(QMainWindow):
         enhancements_group.setLayout(enhancements_layout)
         main_layout.addWidget(enhancements_group)
 
+        # --- Preset Management ---
+        preset_group = QGroupBox("Presets")
+        preset_layout = QHBoxLayout()
+        self.load_preset_button = QPushButton("Load Preset")
+        self.load_preset_button.clicked.connect(self.load_preset)
+        self.save_preset_button = QPushButton("Save Preset")
+        self.save_preset_button.clicked.connect(self.save_preset)
+        preset_layout.addWidget(self.load_preset_button)
+        preset_layout.addWidget(self.save_preset_button)
+        preset_group.setLayout(preset_layout)
+        main_layout.addWidget(preset_group)
+
         # --- Status Bar ---
         self.status_label = QLabel("Status: Stopped")
         main_layout.addWidget(self.status_label)
-
         main_layout.addStretch()
 
     def toggle_listening(self):
         """Starts or stops the audio pipeline."""
         if self.listen_button.isChecked():
-            # --- Start Listening ---
             try:
                 selected_input_name = self.input_combo.currentText()
                 selected_output_name = self.output_combo.currentText()
                 
-                # Find the device index from its name
                 input_idx = next(k for k, v in self.input_devices.items() if v == selected_input_name)
                 output_idx = next(k for k, v in self.output_devices.items() if v == selected_output_name)
 
                 self.audio_pipeline = AudioPipeline(input_idx, output_idx)
-                
-                # Apply current GUI settings to the new pipeline instance
-                self.update_gain()
-                self.update_whisper_boost()
-                
+                self.apply_current_settings_to_pipeline()
                 self.audio_pipeline.start()
                 
                 if not self.audio_pipeline.is_running:
@@ -145,7 +147,6 @@ class SuperHearingApp(QMainWindow):
                 self.listen_button.setChecked(False)
                 self.audio_pipeline = None
         else:
-            # --- Stop Listening ---
             if self.audio_pipeline:
                 self.audio_pipeline.stop()
                 self.audio_pipeline = None
@@ -153,7 +154,7 @@ class SuperHearingApp(QMainWindow):
             self.listen_button.setText("Start Listening")
             self.status_label.setText("Status: Stopped")
             self.record_button.setEnabled(False)
-            self.record_button.setChecked(False) # Uncheck record button if it was on
+            self.record_button.setChecked(False)
             self.input_combo.setEnabled(True)
             self.output_combo.setEnabled(True)
 
@@ -170,9 +171,7 @@ class SuperHearingApp(QMainWindow):
                 self.record_button.setText("Record")
                 self.status_label.setText("Status: Listening")
 
-
     def update_gain(self):
-        """Updates the gain in the audio pipeline."""
         gain_val = self.gain_slider.value()
         self.gain_label.setText(f"{gain_val} dB")
         if self.audio_pipeline:
@@ -180,12 +179,65 @@ class SuperHearingApp(QMainWindow):
                 self.audio_pipeline.gain_db = float(gain_val)
 
     def update_whisper_boost(self):
-        """Updates the whisper boost setting in the pipeline."""
         is_enabled = self.whisper_boost_checkbox.isChecked()
         if self.audio_pipeline:
             with self.audio_pipeline.lock:
                 self.audio_pipeline.whisper_boost_enabled = is_enabled
-    
+
+    def apply_current_settings_to_pipeline(self):
+        """Applies all GUI settings to the audio pipeline instance."""
+        self.update_gain()
+        self.update_whisper_boost()
+
+    def load_preset(self):
+        """Opens a file dialog to load a JSON preset file."""
+        presets_dir = 'presets'
+        os.makedirs(presets_dir, exist_ok=True)
+        
+        options = QFileDialog.Options()
+        fileName, _ = QFileDialog.getOpenFileName(self, "Load Preset", presets_dir, "JSON Files (*.json)", options=options)
+        if fileName:
+            try:
+                with open(fileName, 'r') as f:
+                    settings = json.load(f)
+                self.apply_settings_from_preset(settings)
+                QMessageBox.information(self, "Success", f"Preset '{os.path.basename(fileName)}' loaded.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load preset file:\n{e}")
+
+    def save_preset(self):
+        """Opens a file dialog to save the current settings to a JSON preset file."""
+        presets_dir = 'presets'
+        os.makedirs(presets_dir, exist_ok=True)
+        
+        options = QFileDialog.Options()
+        fileName, _ = QFileDialog.getSaveFileName(self, "Save Preset", presets_dir, "JSON Files (*.json)", options=options)
+        if fileName:
+            # Ensure the filename ends with .json
+            if not fileName.endswith('.json'):
+                fileName += '.json'
+            
+            current_settings = {
+                "gain_db": self.gain_slider.value(),
+                "whisper_boost_enabled": self.whisper_boost_checkbox.isChecked(),
+                # Add other settings here as they are implemented (e.g., filters)
+            }
+            
+            try:
+                with open(fileName, 'w') as f:
+                    json.dump(current_settings, f, indent=4)
+                QMessageBox.information(self, "Success", f"Preset saved to '{os.path.basename(fileName)}'.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save preset file:\n{e}")
+
+    def apply_settings_from_preset(self, settings):
+        """Applies settings from a loaded preset to the GUI and pipeline."""
+        self.gain_slider.setValue(settings.get("gain_db", 10))
+        self.whisper_boost_checkbox.setChecked(settings.get("whisper_boost_enabled", False))
+        
+        # This will automatically update the pipeline if it's running
+        self.apply_current_settings_to_pipeline()
+
     def closeEvent(self, event):
         """Ensures the audio stream is stopped when the app closes."""
         self._is_exiting = True
@@ -194,12 +246,11 @@ class SuperHearingApp(QMainWindow):
             self.audio_pipeline.stop()
         event.accept()
 
-
 if __name__ == '__main__':
-    # Ensure recordings directory exists
-    if not os.path.exists('recordings'):
-        os.makedirs('recordings')
-        
+    for directory in ['recordings', 'presets']:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            
     app = QApplication(sys.argv)
     main_win = SuperHearingApp()
     main_win.show()
